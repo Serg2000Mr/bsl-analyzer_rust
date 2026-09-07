@@ -335,10 +335,8 @@ fn analyze_salsa(
     let profiling_enabled = only_diagnostic.is_some();
     let jsonl = matches!(format, OutputFormat::Jsonl);
 
-    // Honour `--workers` by sizing the global rayon pool before any rayon use
-    // (metadata load and the per-chunk `par_iter` both draw from it). Must run
-    // before `load_metadata`, which initialises the pool on first parallel read;
-    // best-effort because the pool can only be built once per process.
+    // Honour `--workers` before metadata loading and the per-chunk `par_iter`
+    // first use rayon; the global pool can only be configured once per process.
     if let Some(w) = workers.filter(|w| *w > 0) {
         if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(w).build_global() {
             tracing::warn!("Failed to set worker count to {w}: {e}");
@@ -371,16 +369,14 @@ fn analyze_salsa(
         project_model::ProjectConfig::load(&source_dir)?.unwrap_or_default()
     };
 
-    // Applied before anything reads the config: `configuration_path` and
-    // `load_metadata` below run on this value, and the path the first produces
-    // becomes the interned configuration input the diagnostics resolve through.
+    // Apply source selection before resolving paths: the resulting configuration
+    // path becomes the interned input used by diagnostics and metadata loading.
     source_set.resolve(&source_dir)?.apply_to(&mut proj_config);
 
     let scope = build_scope(&source_dir, &scope_args, proj_config.analysis.diff_base.as_deref())?;
     let author_filter =
         build_author_filter(&source_dir, &ignored_authors, &proj_config.analysis.ignored_authors)?;
 
-    let _metadata = proj_config.load_metadata(&source_dir)?;
     let configuration_path = proj_config.resolve_configuration_path(&source_dir)?;
 
     // Scope the file walk to the configuration source root (+ extension roots)
@@ -988,16 +984,15 @@ fn analyze_salsa(
 
         let mut failed_files = 0;
         for (i, (_, path)) in file_ids.iter().enumerate() {
-            let diagnostics =
-                file_analyses[i].as_ref().map(|f| f.diagnostics.clone()).unwrap_or_default();
-            let error = errors_list[i].clone();
+            let diagnostics = file_analyses[i].take().map(|f| f.diagnostics).unwrap_or_default();
+            let error = errors_list[i].take();
             if error.is_some() {
                 failed_files += 1;
             }
             let file_event = FileEvent::new(
                 path.display().to_string(),
                 diagnostics,
-                metrics_list[i].clone(),
+                metrics_list[i].take(),
                 error,
             );
             println!("{}", serde_json::to_string(&file_event)?);
@@ -1005,7 +1000,7 @@ fn analyze_salsa(
 
         let done_event =
             DoneEvent::new(elapsed.as_secs_f64(), file_ids.len(), total_diagnostics, failed_files)
-                .with_baseline(baseline_summary.clone().unwrap_or_else(
+                .with_baseline(baseline_summary.unwrap_or_else(
                     ide::diagnostics_baseline::DiagnosticsBaselineSummary::disabled,
                 ));
         println!("{}", serde_json::to_string(&done_event)?);
