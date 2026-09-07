@@ -393,7 +393,9 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first.docs, &second.docs));
         assert!(Arc::ptr_eq(&first.docs[&uri], &second.docs[&uri]));
-        assert_eq!(first.get(&uri).unwrap().text().as_ptr(), second.get(&uri).unwrap().text().as_ptr());
+        let first_text = first.get(&uri).unwrap().text();
+        let second_text = second.get(&uri).unwrap().text();
+        assert_eq!(first_text.as_ptr(), second_text.as_ptr());
     }
 
     #[test]
@@ -464,5 +466,65 @@ mod tests {
         assert_eq!(frozen.get(&uri).unwrap().text(), "original");
         assert_eq!(frozen.get(&uri).unwrap().version(), 1);
         assert!(Arc::ptr_eq(&live.freeze().docs, &other_live.freeze().docs));
+    }
+
+    #[test]
+    fn editing_without_snapshots_reuses_document_storage() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///unshared.bsl").unwrap();
+        mem_docs.insert(uri.clone(), "old text".to_owned(), 1);
+        let before = Arc::as_ptr(&mem_docs.docs.read()[&uri]);
+
+        mem_docs.update(
+            &uri,
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "new text".to_owned(),
+            }],
+        );
+
+        assert_eq!(before, Arc::as_ptr(&mem_docs.docs.read()[&uri]));
+        assert_eq!(mem_docs.get(&uri).as_deref(), Some("new text"));
+        assert_eq!(mem_docs.get_version(&uri), Some(2));
+    }
+
+    #[test]
+    fn frozen_unicode_text_and_line_index_survive_sequential_edits() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///unicode.bsl").unwrap();
+        mem_docs.insert(uri.clone(), "а\nб".to_owned(), 3);
+        let before = mem_docs.freeze();
+        let changes = vec![
+            TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position { line: 0, character: 1 },
+                    end: lsp_types::Position { line: 0, character: 1 },
+                }),
+                range_length: None,
+                text: "😀".to_owned(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position { line: 1, character: 0 },
+                    end: lsp_types::Position { line: 1, character: 1 },
+                }),
+                range_length: None,
+                text: "вг".to_owned(),
+            },
+        ];
+
+        mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).unwrap();
+        let after = mem_docs.freeze();
+        let old = before.get(&uri).unwrap();
+        let new = after.get(&uri).unwrap();
+
+        assert_eq!(old.text(), "а\nб");
+        assert_eq!(old.version(), 3);
+        assert_eq!(new.text(), "а😀\nвг");
+        assert_eq!(new.version(), 4);
+        let second_line = LineCol { line: 1, col: 0 };
+        assert_eq!(old.line_index().line_col(TextSize::of("а\n")), second_line);
+        assert_eq!(new.line_index().line_col(TextSize::of("а😀\n")), second_line);
     }
 }
