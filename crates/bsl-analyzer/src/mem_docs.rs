@@ -8,16 +8,11 @@ use rustc_hash::FxHashMap;
 
 use crate::lsp::PositionEncoding;
 
+type DocumentMap = FxHashMap<Url, Arc<FrozenDocument>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct MemDocs {
-    docs: Arc<RwLock<FxHashMap<Url, DocumentData>>>,
-}
-
-#[derive(Debug, Clone)]
-struct DocumentData {
-    text: String,
-    version: i32,
-    line_index: LineIndex,
+    docs: Arc<RwLock<Arc<DocumentMap>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,12 +38,12 @@ impl FrozenDocument {
 
 #[derive(Debug, Clone, Default)]
 pub struct FrozenMemDocs {
-    docs: Arc<FxHashMap<Url, FrozenDocument>>,
+    docs: Arc<DocumentMap>,
 }
 
 impl FrozenMemDocs {
     pub fn get(&self, uri: &Url) -> Option<&FrozenDocument> {
-        self.docs.get(uri)
+        self.docs.get(uri).map(Arc::as_ref)
     }
 
     pub fn len(&self) -> usize {
@@ -67,8 +62,8 @@ impl MemDocs {
 
     pub fn insert(&mut self, uri: Url, text: String, version: i32) {
         let line_index = LineIndex::new(&text);
-        let data = DocumentData { text, version, line_index };
-        self.docs.write().insert(uri, data);
+        let data = Arc::new(FrozenDocument { text, version, line_index });
+        Arc::make_mut(&mut self.docs.write()).insert(uri, data);
     }
 
     pub fn update(&mut self, uri: &Url, changes: Vec<TextDocumentContentChangeEvent>) {
@@ -85,7 +80,10 @@ impl MemDocs {
     ) -> Result<()> {
         let mut docs = self.docs.write();
 
-        if let Some(data) = docs.get_mut(uri) {
+        if let Some(data) = Arc::make_mut(&mut docs).get_mut(uri) {
+            // Requests already dispatched must keep their text, version and line index.
+            // The map clone shares every other document instead of copying its contents.
+            let data = Arc::make_mut(data);
             for change in changes {
                 if let Some(range) = change.range {
                     let start = lsp_position_to_offset(
@@ -113,7 +111,7 @@ impl MemDocs {
     }
 
     pub fn remove(&mut self, uri: &Url) {
-        self.docs.write().remove(uri);
+        Arc::make_mut(&mut self.docs.write()).remove(uri);
     }
 
     pub fn get(&self, uri: &Url) -> Option<String> {
@@ -144,22 +142,9 @@ impl MemDocs {
         self.docs.read().keys().cloned().collect()
     }
 
+    /// Share the immutable map; mutations detach it only while a snapshot is alive.
     pub fn freeze(&self) -> FrozenMemDocs {
-        let live = self.docs.read();
-        let frozen: FxHashMap<Url, FrozenDocument> = live
-            .iter()
-            .map(|(uri, data)| {
-                (
-                    uri.clone(),
-                    FrozenDocument {
-                        text: data.text.clone(),
-                        version: data.version,
-                        line_index: data.line_index.clone(),
-                    },
-                )
-            })
-            .collect();
-        FrozenMemDocs { docs: Arc::new(frozen) }
+        FrozenMemDocs { docs: Arc::clone(&self.docs.read()) }
     }
 }
 
@@ -395,5 +380,151 @@ mod tests {
         mem_docs.update(&uri, changes);
 
         assert_eq!(mem_docs.get(&uri), Some("Процедура Тест()\nКонецПроцедуры".to_string()));
+    }
+
+    #[test]
+    fn repeated_freezes_share_the_map_and_document_storage() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///large.bsl").unwrap();
+        mem_docs.insert(uri.clone(), "Процедура Тест()\nКонецПроцедуры\n".repeat(1024), 1);
+
+        let first = mem_docs.freeze();
+        let second = mem_docs.freeze();
+
+        assert!(Arc::ptr_eq(&first.docs, &second.docs));
+        assert!(Arc::ptr_eq(&first.docs[&uri], &second.docs[&uri]));
+        let first_text = first.get(&uri).unwrap().text();
+        let second_text = second.get(&uri).unwrap().text();
+        assert_eq!(first_text.as_ptr(), second_text.as_ptr());
+    }
+
+    #[test]
+    fn editing_detaches_only_the_changed_document() {
+        let mut mem_docs = MemDocs::new();
+        let edited = Url::parse("file:///edited.bsl").unwrap();
+        let untouched = Url::parse("file:///untouched.bsl").unwrap();
+        mem_docs.insert(edited.clone(), "old\ntext".to_owned(), 1);
+        mem_docs.insert(untouched.clone(), "unchanged".to_owned(), 7);
+        let before = mem_docs.freeze();
+
+        mem_docs.update(
+            &edited,
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "new text".to_owned(),
+            }],
+        );
+        let after = mem_docs.freeze();
+
+        assert!(!Arc::ptr_eq(&before.docs, &after.docs));
+        assert!(!Arc::ptr_eq(&before.docs[&edited], &after.docs[&edited]));
+        assert!(Arc::ptr_eq(&before.docs[&untouched], &after.docs[&untouched]));
+        assert_eq!(before.get(&edited).unwrap().text(), "old\ntext");
+        assert_eq!(before.get(&edited).unwrap().version(), 1);
+        assert_eq!(after.get(&edited).unwrap().text(), "new text");
+        assert_eq!(after.get(&edited).unwrap().version(), 2);
+        let offset = TextSize::of("old\n");
+        assert_eq!(before.get(&edited).unwrap().line_index().line_col(offset).line, 1);
+        assert_eq!(after.get(&edited).unwrap().line_index().line_col(offset).line, 0);
+    }
+
+    #[test]
+    fn insert_and_remove_preserve_earlier_snapshots() {
+        let mut mem_docs = MemDocs::new();
+        let first_uri = Url::parse("file:///first.bsl").unwrap();
+        let second_uri = Url::parse("file:///second.bsl").unwrap();
+        mem_docs.insert(first_uri.clone(), "first".to_owned(), 1);
+        let first = mem_docs.freeze();
+
+        mem_docs.insert(second_uri.clone(), "second".to_owned(), 2);
+        let both = mem_docs.freeze();
+        mem_docs.remove(&first_uri);
+        let last = mem_docs.freeze();
+
+        assert_eq!(first.len(), 1);
+        assert!(first.get(&second_uri).is_none());
+        assert_eq!(both.len(), 2);
+        assert!(last.get(&first_uri).is_none());
+        assert_eq!(last.len(), 1);
+        assert!(Arc::ptr_eq(&first.docs[&first_uri], &both.docs[&first_uri]));
+        assert!(Arc::ptr_eq(&both.docs[&second_uri], &last.docs[&second_uri]));
+    }
+
+    #[test]
+    fn cloned_live_handles_see_changes_but_frozen_handles_do_not() {
+        let mut live = MemDocs::new();
+        let uri = Url::parse("file:///shared.bsl").unwrap();
+        live.insert(uri.clone(), "original".to_owned(), 1);
+        let mut other_live = live.clone();
+        let frozen = live.freeze();
+
+        other_live.insert(uri.clone(), "replacement".to_owned(), 2);
+
+        assert_eq!(live.get(&uri).as_deref(), Some("replacement"));
+        assert_eq!(live.get_version(&uri), Some(2));
+        assert_eq!(frozen.get(&uri).unwrap().text(), "original");
+        assert_eq!(frozen.get(&uri).unwrap().version(), 1);
+        assert!(Arc::ptr_eq(&live.freeze().docs, &other_live.freeze().docs));
+    }
+
+    #[test]
+    fn editing_without_snapshots_reuses_document_storage() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///unshared.bsl").unwrap();
+        mem_docs.insert(uri.clone(), "old text".to_owned(), 1);
+        let before = Arc::as_ptr(&mem_docs.docs.read()[&uri]);
+
+        mem_docs.update(
+            &uri,
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "new text".to_owned(),
+            }],
+        );
+
+        assert_eq!(before, Arc::as_ptr(&mem_docs.docs.read()[&uri]));
+        assert_eq!(mem_docs.get(&uri).as_deref(), Some("new text"));
+        assert_eq!(mem_docs.get_version(&uri), Some(2));
+    }
+
+    #[test]
+    fn frozen_unicode_text_and_line_index_survive_sequential_edits() {
+        let mut mem_docs = MemDocs::new();
+        let uri = Url::parse("file:///unicode.bsl").unwrap();
+        mem_docs.insert(uri.clone(), "а\nб".to_owned(), 3);
+        let before = mem_docs.freeze();
+        let changes = vec![
+            TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position { line: 0, character: 1 },
+                    end: lsp_types::Position { line: 0, character: 1 },
+                }),
+                range_length: None,
+                text: "😀".to_owned(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position { line: 1, character: 0 },
+                    end: lsp_types::Position { line: 1, character: 1 },
+                }),
+                range_length: None,
+                text: "вг".to_owned(),
+            },
+        ];
+
+        mem_docs.update_with_encoding(&uri, changes, PositionEncoding::Utf16).unwrap();
+        let after = mem_docs.freeze();
+        let old = before.get(&uri).unwrap();
+        let new = after.get(&uri).unwrap();
+
+        assert_eq!(old.text(), "а\nб");
+        assert_eq!(old.version(), 3);
+        assert_eq!(new.text(), "а😀\nвг");
+        assert_eq!(new.version(), 4);
+        let second_line = LineCol { line: 1, col: 0 };
+        assert_eq!(old.line_index().line_col(TextSize::of("а\n")), second_line);
+        assert_eq!(new.line_index().line_col(TextSize::of("а😀\n")), second_line);
     }
 }
