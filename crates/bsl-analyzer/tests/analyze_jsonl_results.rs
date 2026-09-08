@@ -29,16 +29,10 @@ fn run_jsonl(source_dir: &Path) -> Vec<Value> {
 #[test]
 fn jsonl_keeps_findings_clean_files_and_totals_across_chunks() {
     let temp = TempDir::new().expect("tempdir");
-    fs::write(
-        temp.path().join("Finding.bsl"),
-        "Процедура Тест()\n    А = А;\nКонецПроцедуры\n",
-    )
-    .expect("finding fixture");
-    fs::write(
-        temp.path().join("Clean.bsl"),
-        "Процедура Тест()\n    А = 1;\nКонецПроцедуры\n",
-    )
-    .expect("clean fixture");
+    fs::write(temp.path().join("Finding.bsl"), "Процедура Тест()\n    А = А;\nКонецПроцедуры\n")
+        .expect("finding fixture");
+    fs::write(temp.path().join("Clean.bsl"), "Процедура Тест()\n    А = 1;\nКонецПроцедуры\n")
+        .expect("clean fixture");
 
     let events = run_jsonl(temp.path());
     assert_eq!(events.len(), 4);
